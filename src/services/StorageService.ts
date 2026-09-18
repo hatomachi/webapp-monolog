@@ -5,6 +5,8 @@ const CONFIG_STORAGE_KEY = 'monolog_storage_config';
 const ENTRIES_IDB_KEY = 'monolog_local_entries_v1';
 
 export const DEFAULT_CONFIG: StorageConfig = {
+  provider: 'github',
+  baseUrl: '',
   token: '',
   owner: '',
   repo: 'personal-vault',
@@ -16,13 +18,19 @@ export const DEFAULT_CONFIG: StorageConfig = {
 
 export class StorageService {
   /**
-   * 設定を取得。webapp-obsidianの設定が存在する場合は自動的にトークンやownerを提案・補完
+   * 設定を取得。webapp-obsidianの設定が存在する場合は自動的にトークンやowner、providerを提案・補完
    */
   static getConfig(): StorageConfig {
     try {
       const raw = localStorage.getItem(CONFIG_STORAGE_KEY);
       if (raw) {
-        return { ...DEFAULT_CONFIG, ...JSON.parse(raw) };
+        const parsed = JSON.parse(raw);
+        return {
+          ...DEFAULT_CONFIG,
+          ...parsed,
+          provider: parsed.provider || 'github',
+          baseUrl: parsed.baseUrl || '',
+        };
       }
 
       // webapp-obsidian の設定があれば流用（初回起動時のユーザー体験向上）
@@ -33,6 +41,8 @@ export class StorageService {
         if (personal) {
           return {
             ...DEFAULT_CONFIG,
+            provider: personal.provider || 'github',
+            baseUrl: personal.baseUrl || '',
             token: personal.token || '',
             owner: personal.owner || '',
             repo: personal.repo || 'personal-vault',

@@ -3,7 +3,7 @@ import { Settings, Sparkles, RefreshCw, AlertCircle } from 'lucide-react';
 import { MonologEntry, StorageConfig, LocationInfo, LocationStatus } from './types';
 import { StorageService } from './services/StorageService';
 import { LocationService } from './services/LocationService';
-import { GitHubSyncService } from './services/GitHubSyncService';
+import { GitSyncService } from './services/GitSyncService';
 import { InputArea } from './components/InputArea';
 import { Timeline } from './components/Timeline';
 import { SettingsModal } from './components/SettingsModal';
@@ -42,14 +42,15 @@ export const App: React.FC = () => {
     setIsSyncing(true);
 
     try {
-      const res = await GitHubSyncService.syncPendingEntries();
+      const providerLabel = config.provider === 'gitlab' ? 'GitLab' : 'GitHub';
+      const res = await GitSyncService.syncPendingEntries();
       // 最新のローカルステータス（同期完了フラグ）を反映
       const updated = await StorageService.getEntries();
       setEntries(updated);
 
       if (res.syncedCount > 0) {
         setSyncToast({
-          message: `${res.syncedCount} 件を GitHub に同期しました`,
+          message: `${res.syncedCount} 件を ${providerLabel} に同期しました`,
           type: 'success',
         });
         setTimeout(() => setSyncToast(null), 3000);
@@ -65,11 +66,11 @@ export const App: React.FC = () => {
     } finally {
       setIsSyncing(false);
     }
-  }, [isSyncing]);
+  }, [isSyncing, config.provider]);
 
   // アプリ起動時 & オンライン復帰時の自動同期
   useEffect(() => {
-    if (config.token && config.owner && config.repo) {
+    if (GitSyncService.isConfigured(config)) {
       triggerSync();
     }
 
@@ -78,7 +79,7 @@ export const App: React.FC = () => {
     };
     window.addEventListener('online', handleOnline);
     return () => window.removeEventListener('online', handleOnline);
-  }, [config.token, config.owner, config.repo, triggerSync]);
+  }, [config, triggerSync]);
 
   // つぶやき送信ハンドラ（0.1秒入力・完全ローカルファースト）
   const handleSend = async (text: string, location?: LocationInfo) => {
@@ -88,6 +89,8 @@ export const App: React.FC = () => {
     const dateStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
     const timeStr = `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
 
+    const isConfigured = GitSyncService.isConfigured(config);
+
     const newEntry: MonologEntry = {
       id: `entry_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
       text,
@@ -95,15 +98,15 @@ export const App: React.FC = () => {
       dateStr,
       timeStr,
       location: config.enableLocation ? location : undefined,
-      syncStatus: config.token ? 'pending' : 'synced', // トークン未設定時はローカル完結
+      syncStatus: isConfigured ? 'pending' : 'synced', // トークン未設定時はローカル完結
     };
 
     // 0msローカル即時保存
     const updated = await StorageService.addEntry(newEntry);
     setEntries(updated);
 
-    // バックグラウンドでGitHub同期をトリガー
-    if (config.token && config.owner && config.repo) {
+    // バックグラウンドでリモート同期をトリガー
+    if (isConfigured) {
       setTimeout(() => {
         triggerSync();
       }, 300);
@@ -125,6 +128,8 @@ export const App: React.FC = () => {
   // 未同期件数
   const pendingCount = entries.filter((e) => e.syncStatus === 'pending').length;
   const failedCount = entries.filter((e) => e.syncStatus === 'failed').length;
+  const isConfigured = GitSyncService.isConfigured(config);
+  const providerLabel = config.provider === 'gitlab' ? 'GitLab' : 'GitHub';
 
   return (
     <div className="flex flex-col h-full w-full max-w-lg mx-auto bg-zinc-950 text-zinc-100 overflow-hidden select-none">
@@ -168,10 +173,10 @@ export const App: React.FC = () => {
                 <AlertCircle className="w-3 h-3 text-rose-400" />
                 <span className="text-[11px] text-rose-300 font-medium">エラー {failedCount}</span>
               </>
-            ) : config.token ? (
+            ) : isConfigured ? (
               <span className="text-[11px] text-emerald-400 flex items-center gap-1">
                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-                同期完了
+                {providerLabel}同期
               </span>
             ) : (
               <span className="text-[11px] text-zinc-500">未設定</span>

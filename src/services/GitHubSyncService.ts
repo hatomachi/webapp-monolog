@@ -1,6 +1,12 @@
 import { Octokit } from '@octokit/rest';
-import { MonologEntry, StorageConfig } from '../types';
+import { StorageConfig } from '../types';
 import { StorageService } from './StorageService';
+import {
+  buildMarkdownForDate,
+  decodeBase64Utf8,
+  encodeUtf8Base64,
+  resolveFilePath,
+} from './markdownFormatter';
 
 export class GitHubSyncService {
   private static octokitCache = new Map<string, Octokit>();
@@ -18,7 +24,9 @@ export class GitHubSyncService {
   /**
    * 接続テスト
    */
-  static async testConnection(config: StorageConfig): Promise<{ success: boolean; message: string }> {
+  static async testConnection(
+    config: StorageConfig
+  ): Promise<{ success: boolean; message: string; username?: string }> {
     if (!config.token || !config.owner || !config.repo) {
       return { success: false, message: 'Token, Owner, Repo が未入力です' };
     }
@@ -34,6 +42,7 @@ export class GitHubSyncService {
       return {
         success: true,
         message: `接続成功: ${repo.full_name} (${repo.private ? 'Private' : 'Public'}) / ユーザー: ${user.login}`,
+        username: user.login,
       };
     } catch (e: any) {
       return {
@@ -46,12 +55,14 @@ export class GitHubSyncService {
   /**
    * 未同期エントリをバックグラウンドでGitHubに同期
    */
-  static async syncPendingEntries(): Promise<{ syncedCount: number; errors: string[] }> {
+  static async syncPendingEntries(
+    providedConfig?: StorageConfig
+  ): Promise<{ syncedCount: number; errors: string[] }> {
     if (this.isSyncing) {
       return { syncedCount: 0, errors: [] };
     }
 
-    const config = StorageService.getConfig();
+    const config = providedConfig || StorageService.getConfig();
     if (!config.token || !config.owner || !config.repo) {
       return { syncedCount: 0, errors: ['GitHub設定が未完了です'] };
     }
@@ -67,7 +78,7 @@ export class GitHubSyncService {
       }
 
       // 日付（dateStr: YYYY-MM-DD）ごとにエントリをグループ化
-      const byDate = new Map<string, MonologEntry[]>();
+      const byDate = new Map<string, typeof pending>();
       pending.forEach((entry) => {
         const list = byDate.get(entry.dateStr) || [];
         list.push(entry);
@@ -78,10 +89,7 @@ export class GitHubSyncService {
 
       for (const [dateStr, entries] of byDate.entries()) {
         try {
-          // パス決定: 例 "00_Inbox/monolog/2026/2026-09-12.md"
-          const year = dateStr.slice(0, 4);
-          const cleanBasePath = config.basePath.replace(/^\/+|\/+$/g, '');
-          const filePath = cleanBasePath ? `${cleanBasePath}/${year}/${dateStr}.md` : `${year}/${dateStr}.md`;
+          const filePath = resolveFilePath(config.basePath, dateStr);
 
           // 既存ファイルを取得
           let existingContent = '';
@@ -106,37 +114,12 @@ export class GitHubSyncService {
             // 404 (ファイル未存在) は新規作成として扱う
           }
 
-          // 新規作成時の初期ヘッダー
-          if (!existingContent.trim()) {
-            const dayOfWeek = getDayOfWeek(dateStr);
-            existingContent = `# ${dateStr} (${dayOfWeek})\n\n`;
-          }
-
-          // 各エントリを追記フォーマットに変換
-          let updatedContent = existingContent;
-          const successfullyAppendedEntries: MonologEntry[] = [];
-
-          // 日時順（古い順）に追記
-          const sortedEntries = [...entries].sort(
-            (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+          // 各エントリを追記フォーマットにマージ
+          const { updatedContent, successfullyAppendedEntries } = buildMarkdownForDate(
+            dateStr,
+            existingContent,
+            entries
           );
-
-          for (const entry of sortedEntries) {
-            // 既にファイル内に同じIDが存在している場合はスキップ（二重追記防止）
-            if (updatedContent.includes(`id=${entry.id}`)) {
-              successfullyAppendedEntries.push(entry);
-              continue;
-            }
-
-            const formattedEntry = formatEntryToMarkdown(entry);
-            if (!updatedContent.endsWith('\n\n') && !updatedContent.endsWith('\n')) {
-              updatedContent += '\n\n';
-            } else if (!updatedContent.endsWith('\n\n')) {
-              updatedContent += '\n';
-            }
-            updatedContent += formattedEntry + '\n';
-            successfullyAppendedEntries.push(entry);
-          }
 
           if (successfullyAppendedEntries.length === 0) {
             continue;
@@ -191,51 +174,4 @@ export class GitHubSyncService {
   }
 }
 
-/**
- * MonologEntry を Obsidian 互換の Markdown ブロックにフォーマット
- */
-function formatEntryToMarkdown(entry: MonologEntry): string {
-  const shortTime = entry.timeStr.slice(0, 5); // HH:mm
-  let locationPart = '';
-
-  if (entry.location) {
-    if (entry.location.address) {
-      locationPart = ` 📍 *${entry.location.address}*`;
-    } else {
-      locationPart = ` 📍 *[${entry.location.latitude}, ${entry.location.longitude}]*`;
-    }
-  }
-
-  // 本文の複数行処理（箇条書きリスト内でのインデント）
-  const lines = entry.text.split('\n');
-  const firstLine = lines[0];
-  const restLines = lines.slice(1).map((l) => `  ${l}`).join('\n');
-
-  let body = `- **${shortTime}**${locationPart}  \n  ${firstLine}`;
-  if (restLines) {
-    body += `\n${restLines}`;
-  }
-
-  // メタデータ（ID、座標等）
-  const metaParts = [`id=${entry.id}`];
-  if (entry.location) {
-    metaParts.push(`geo=${entry.location.latitude},${entry.location.longitude}`);
-  }
-  const commentTag = `  <!-- monolog:${metaParts.join(';')} -->`;
-
-  return `${body}\n${commentTag}`;
-}
-
-function getDayOfWeek(dateStr: string): string {
-  const d = new Date(dateStr + 'T00:00:00');
-  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-  return days[d.getDay()] || '';
-}
-
-function encodeUtf8Base64(str: string): string {
-  return btoa(unescape(encodeURIComponent(str)));
-}
-
-function decodeBase64Utf8(base64: string): string {
-  return decodeURIComponent(escape(atob(base64.replace(/\n/g, ''))));
-}
+export * from './markdownFormatter';

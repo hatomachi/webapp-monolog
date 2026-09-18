@@ -18,10 +18,14 @@ export interface MonologEntry {
   syncedAt?: string;
 }
 
+export type GitProvider = 'github' | 'gitlab';
+
 export interface StorageConfig {
+  provider: GitProvider;
+  baseUrl?: string; // GitLab用 Base URL (例: https://gitlab.internal.example.com)
   token: string;
-  owner: string;
-  repo: string;
+  owner: string; // GitHub: ユーザー名 / GitLab: グループまたは名前空間 (空欄可)
+  repo: string; // GitHub: リポジトリ名 / GitLab: プロジェクト名またはプロジェクトID
   branch: string;
   basePath: string; // デフォルト: "00_Inbox/monolog"
   enableLocation: boolean;

@@ -94,12 +94,12 @@ export const Timeline: React.FC<TimelineProps> = ({
                     <div className="flex items-center space-x-2 flex-shrink-0">
                       {/* 同期ステータス */}
                       {entry.syncStatus === 'synced' && (
-                        <span title="GitHub同期済み" className="text-emerald-400">
+                        <span title="リモート同期済み" className="text-emerald-400">
                           <CheckCircle2 className="w-3.5 h-3.5" />
                         </span>
                       )}
                       {entry.syncStatus === 'pending' && (
-                        <span title="GitHub同期待機中" className="text-amber-400 animate-pulse">
+                        <span title="リモート同期待機中" className="text-amber-400 animate-pulse">
                           <Clock className="w-3.5 h-3.5" />
                         </span>
                       )}
