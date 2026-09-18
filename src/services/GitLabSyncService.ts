@@ -6,7 +6,17 @@ import {
   resolveFilePath,
 } from './markdownFormatter';
 
+export interface GitLabProjectMetadata {
+  id: string;
+  defaultBranch: string;
+  emptyRepo: boolean;
+  name: string;
+  pathWithNamespace: string;
+}
+
 export class GitLabSyncService {
+  private static metadataCache = new Map<string, GitLabProjectMetadata>();
+
   /**
    * Resolve GitLab API base URL (例: https://gitlab.example.com/api/v4)
    */
@@ -59,7 +69,42 @@ export class GitLabSyncService {
   }
 
   /**
-   * 接続テスト
+   * プロジェクトメタデータ取得（キャッシュ付き）
+   */
+  public static async getProjectMetadata(config: StorageConfig): Promise<GitLabProjectMetadata> {
+    const cacheKey = `gitlab_meta_${config.baseUrl || 'gitlab'}_${config.owner}_${config.repo}`;
+    if (this.metadataCache.has(cacheKey)) {
+      return this.metadataCache.get(cacheKey)!;
+    }
+
+    const rawPath = this.getProjectId(config);
+    const res = await this.apiFetch(config, `/projects/${rawPath}`);
+    if (!res.ok) {
+      let errMsg = `${res.status} ${res.statusText}`;
+      try {
+        const errJson = await res.json();
+        if (errJson.message) {
+          errMsg += ` - ${typeof errJson.message === 'string' ? errJson.message : JSON.stringify(errJson.message)}`;
+        }
+      } catch {}
+      throw new Error(`GitLabプロジェクト "${rawPath}" の取得に失敗しました: ${errMsg}`);
+    }
+
+    const data = await res.json();
+    const meta: GitLabProjectMetadata = {
+      id: String(data.id),
+      defaultBranch: data.default_branch || 'master',
+      emptyRepo: Boolean(data.empty_repo),
+      name: data.name || '',
+      pathWithNamespace: data.path_with_namespace || data.name || config.repo,
+    };
+
+    this.metadataCache.set(cacheKey, meta);
+    return meta;
+  }
+
+  /**
+   * 接続テスト（webapp-obsidian同様にtreeエンドポイントでブランチ自動検出）
    */
   public static async testConnection(
     config: StorageConfig
@@ -82,55 +127,82 @@ export class GitLabSyncService {
       }
 
       // 2. プロジェクト情報取得
-      const projectId = this.getProjectId(config);
-      const projRes = await this.apiFetch(config, `/projects/${projectId}`);
-      if (!projRes.ok) {
-        let errMsg = `${projRes.status} ${projRes.statusText}`;
-        try {
-          const errJson = await projRes.json();
-          if (errJson.message) {
-            errMsg += ` - ${typeof errJson.message === 'string' ? errJson.message : JSON.stringify(errJson.message)}`;
-          }
-        } catch {}
+      const meta = await this.getProjectMetadata(config);
+
+      if (meta.emptyRepo) {
         return {
           success: false,
-          message: `GitLabプロジェクト "${config.owner ? `${config.owner}/${config.repo}` : config.repo}" の取得に失敗しました: ${errMsg}`,
+          message: `プロジェクト「${meta.pathWithNamespace}」は接続成功しましたが、空のリポジトリ（コミットなし）です。初期コミットを作成してください。`,
+          username,
         };
       }
 
-      const projData = await projRes.json();
-      const defaultBranch = projData.default_branch || 'master';
-      const projectName = projData.path_with_namespace || projData.name || config.repo;
+      // 3. リポジトリアクセステスト（candidateBranches: 指定ブランチ -> defaultBranch -> master -> main）
+      const candidateBranches: string[] = [];
+      if (config.branch && config.branch.trim()) {
+        candidateBranches.push(config.branch.trim());
+      }
+      if (meta.defaultBranch && !candidateBranches.includes(meta.defaultBranch)) {
+        candidateBranches.push(meta.defaultBranch);
+      }
+      if (!candidateBranches.includes('master')) candidateBranches.push('master');
+      if (!candidateBranches.includes('main')) candidateBranches.push('main');
 
-      // 3. ブランチ存在確認
-      const targetBranch = config.branch?.trim() || defaultBranch;
-      let finalBranch = targetBranch;
+      let treeSuccess = false;
+      let successfulBranch = '';
+      let lastError = '';
 
-      const branchRes = await this.apiFetch(
-        config,
-        `/projects/${projectId}/repository/branches/${encodeURIComponent(targetBranch)}`
-      );
-      if (!branchRes.ok && targetBranch !== defaultBranch) {
-        const defBranchRes = await this.apiFetch(
+      for (const b of candidateBranches) {
+        const testRes = await this.apiFetch(
           config,
-          `/projects/${projectId}/repository/branches/${encodeURIComponent(defaultBranch)}`
+          `/projects/${meta.id}/repository/tree?ref=${encodeURIComponent(b)}&per_page=1`
         );
-        if (defBranchRes.ok) {
-          finalBranch = defaultBranch;
+        if (testRes.ok) {
+          treeSuccess = true;
+          successfulBranch = b;
+          break;
+        } else {
+          try {
+            const errData = await testRes.json();
+            lastError = errData.message || `${testRes.status} ${testRes.statusText}`;
+          } catch {
+            lastError = `${testRes.status} ${testRes.statusText}`;
+          }
         }
       }
 
+      // ブランチ指定で失敗した場合はref指定なしでデフォルトブランチ取得を試行
+      if (!treeSuccess) {
+        const testNoRefRes = await this.apiFetch(
+          config,
+          `/projects/${meta.id}/repository/tree?per_page=1`
+        );
+        if (testNoRefRes.ok) {
+          treeSuccess = true;
+          successfulBranch = meta.defaultBranch || 'master';
+        }
+      }
+
+      if (!treeSuccess) {
+        return {
+          success: false,
+          message: `プロジェクトは見つかりましたが、リポジトリへのアクセスでエラーになりました (${lastError})。PATに「read_repository」または「api」権限があるか、ブランチ名をご確認ください。`,
+          username,
+        };
+      }
+
+      let branchNotice = `ブランチ: ${successfulBranch}`;
+      if (config.branch && config.branch.trim() !== successfulBranch) {
+        branchNotice += ` (指定の "${config.branch}" が無いため自動切替)`;
+      }
+
       const userPart = username ? `ユーザー: ${username}` : 'トークン有効';
-      const branchNotice =
-        finalBranch !== config.branch && config.branch
-          ? `ブランチ: ${finalBranch} (指定の "${config.branch}" が無いため自動切替)`
-          : `ブランチ: ${finalBranch}`;
 
       return {
         success: true,
-        message: `接続成功: ${projectName} [ID: ${projData.id}] (${userPart} / ${branchNotice})`,
+        message: `接続成功: ${meta.pathWithNamespace} [ID: ${meta.id}] (${userPart} / ${branchNotice})`,
         username,
-        detectedBranch: finalBranch,
+        detectedBranch: successfulBranch,
       };
     } catch (e: any) {
       console.error('GitLab test connection failed:', e);
@@ -160,6 +232,13 @@ export class GitLabSyncService {
         return { syncedCount: 0, errors: [] };
       }
 
+      // プロジェクトメタデータ取得
+      const meta = await this.getProjectMetadata(config);
+      const projectId = meta.id;
+
+      // 使用ブランチの決定（指定ブランチ -> defaultBranch -> master）
+      let targetBranch = (config.branch || '').trim() || meta.defaultBranch || 'master';
+
       // 日付（dateStr: YYYY-MM-DD）ごとにエントリをグループ化
       const byDate = new Map<string, MonologEntry[]>();
       pending.forEach((entry) => {
@@ -168,33 +247,40 @@ export class GitLabSyncService {
         byDate.set(entry.dateStr, list);
       });
 
-      const projectId = this.getProjectId(config);
-      const targetBranch = config.branch?.trim() || 'main';
-
       for (const [dateStr, entries] of byDate.entries()) {
         try {
           const filePath = resolveFilePath(config.basePath, dateStr);
           const encodedFilePath = encodeURIComponent(filePath);
 
-          // 1. 既存ファイルを取得
+          // 1. 既存ファイルを取得（指定ブランチ -> defaultBranch）
           let existingContent = '';
           let fileExists = false;
+          let workingBranch = targetBranch;
 
-          try {
-            // raw エンドポイントで直接ファイル内容を取得
-            const getRes = await this.apiFetch(
-              config,
-              `/projects/${projectId}/repository/files/${encodedFilePath}/raw?ref=${encodeURIComponent(targetBranch)}`
-            );
+          const candidateBranches = [targetBranch];
+          if (meta.defaultBranch && !candidateBranches.includes(meta.defaultBranch)) {
+            candidateBranches.push(meta.defaultBranch);
+          }
 
-            if (getRes.ok) {
-              existingContent = await getRes.text();
-              fileExists = true;
-            } else if (getRes.status !== 404) {
-              console.warn(`[GitLabSync] file get returned status ${getRes.status}`);
+          for (const b of candidateBranches) {
+            try {
+              const getRes = await this.apiFetch(
+                config,
+                `/projects/${projectId}/repository/files/${encodedFilePath}/raw?ref=${encodeURIComponent(b)}`
+              );
+
+              if (getRes.ok) {
+                existingContent = await getRes.text();
+                fileExists = true;
+                workingBranch = b;
+                break;
+              } else if (getRes.status === 404) {
+                // ファイルが存在しない（新規ノート）
+                workingBranch = b;
+              }
+            } catch (fetchErr) {
+              console.warn(`[GitLabSync] Failed to fetch file on branch "${b}":`, fetchErr);
             }
-          } catch (fetchErr) {
-            console.warn('[GitLabSync] Failed to fetch existing file, treating as new:', fetchErr);
           }
 
           // 2. 新規エントリを追記
@@ -213,12 +299,11 @@ export class GitLabSyncService {
           const commitMsg = `feat(monolog): ${dateStr} [${times}]`;
 
           // 3. GitLab Commits API で作成または更新
-          // Commits API は file_path を JSON body に含めるため、リバースプロキシの %2F デコード問題が発生しない
           const base64Content = encodeUtf8Base64(updatedContent);
           let action: 'create' | 'update' = fileExists ? 'update' : 'create';
 
-          const buildPayload = (act: 'create' | 'update') => ({
-            branch: targetBranch,
+          const buildPayload = (act: 'create' | 'update', branchToUse: string) => ({
+            branch: branchToUse,
             commit_message: commitMsg,
             actions: [
               {
@@ -235,21 +320,37 @@ export class GitLabSyncService {
             headers: {
               'Content-Type': 'application/json',
             },
-            body: JSON.stringify(buildPayload(action)),
+            body: JSON.stringify(buildPayload(action, workingBranch)),
           });
 
-          // 競合または作成・更新の食い違い時の自動フォールバック
+          // 指定ブランチが存在しない等で失敗した場合、defaultBranch で再試行
+          if (!commitRes.ok && workingBranch !== meta.defaultBranch && meta.defaultBranch) {
+            console.warn(
+              `[GitLabSync] Commit failed on "${workingBranch}". Retrying with default branch "${meta.defaultBranch}"...`
+            );
+            const defBranchRes = await this.apiFetch(config, `/projects/${projectId}/repository/commits`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify(buildPayload(action, meta.defaultBranch)),
+            });
+
+            if (defBranchRes.ok) {
+              commitRes = defBranchRes;
+              workingBranch = meta.defaultBranch;
+            }
+          }
+
+          // action (create / update) の不一致時の自動フォールバック
           if (!commitRes.ok) {
             const fallbackAction: 'create' | 'update' = action === 'create' ? 'update' : 'create';
-            console.warn(
-              `[GitLabSync] Commit failed with action "${action}" (${commitRes.status}). Retrying with "${fallbackAction}"...`
-            );
             const retryRes = await this.apiFetch(config, `/projects/${projectId}/repository/commits`, {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/json',
               },
-              body: JSON.stringify(buildPayload(fallbackAction)),
+              body: JSON.stringify(buildPayload(fallbackAction, workingBranch)),
             });
 
             if (retryRes.ok) {
@@ -266,6 +367,12 @@ export class GitLabSyncService {
               }
             } catch {}
             throw new Error(`GitLabコミット保存に失敗しました: ${errDetail}`);
+          }
+
+          // ブランチが自動切替された場合は設定も更新
+          if (workingBranch && workingBranch !== config.branch) {
+            const updatedConfig = { ...config, branch: workingBranch };
+            StorageService.saveConfig(updatedConfig);
           }
 
           // 4. ローカルステータスを同期済みに更新

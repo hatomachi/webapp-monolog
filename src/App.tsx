@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Settings, Sparkles, RefreshCw, AlertCircle } from 'lucide-react';
 import { MonologEntry, StorageConfig, LocationInfo, LocationStatus } from './types';
 import { StorageService } from './services/StorageService';
@@ -15,6 +15,7 @@ export const App: React.FC = () => {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncToast, setSyncToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+  const isSyncingRef = useRef(false);
 
   // 初期化: エントリ読込、GPS事前測位開始、初期同期
   useEffect(() => {
@@ -38,11 +39,13 @@ export const App: React.FC = () => {
 
   // バックグラウンド同期実行
   const triggerSync = useCallback(async () => {
-    if (isSyncing) return;
+    if (isSyncingRef.current) return;
+    isSyncingRef.current = true;
     setIsSyncing(true);
 
     try {
-      const providerLabel = config.provider === 'gitlab' ? 'GitLab' : 'GitHub';
+      const currentConfig = StorageService.getConfig();
+      const providerLabel = currentConfig.provider === 'gitlab' ? 'GitLab' : 'GitHub';
       const res = await GitSyncService.syncPendingEntries();
       // 最新のローカルステータス（同期完了フラグ）を反映
       const updated = await StorageService.getEntries();
@@ -64,9 +67,10 @@ export const App: React.FC = () => {
     } catch (e: any) {
       console.error('Manual sync failed:', e);
     } finally {
+      isSyncingRef.current = false;
       setIsSyncing(false);
     }
-  }, [isSyncing, config.provider]);
+  }, []);
 
   // アプリ起動時 & オンライン復帰時の自動同期
   useEffect(() => {
@@ -79,7 +83,7 @@ export const App: React.FC = () => {
     };
     window.addEventListener('online', handleOnline);
     return () => window.removeEventListener('online', handleOnline);
-  }, [config, triggerSync]);
+  }, [config.token, config.owner, config.repo, config.branch, config.provider, config.baseUrl, triggerSync]);
 
   // つぶやき送信ハンドラ（0.1秒入力・完全ローカルファースト）
   const handleSend = async (text: string, location?: LocationInfo) => {
